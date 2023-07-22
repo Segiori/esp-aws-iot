@@ -59,6 +59,27 @@
 /* POSIX includes. */
 #include <unistd.h>
 
+/* UART Echo Example
+
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include "soc/uart_periph.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
+#include "hal/gpio_hal.h"
+#include "sdkconfig.h"
+#include "esp_console.h"
+#include "linenoise/linenoise.h"
+#include <string.h>
+
 /* Include Demo Config as the first non-system header. */
 #include "demo_config.h"
 
@@ -76,7 +97,7 @@
 #include "clock.h"
 
 #ifdef CONFIG_EXAMPLE_USE_ESP_SECURE_CERT_MGR
-    #include "esp_secure_cert_read.h"    
+    #include "esp_secure_cert_read.h"
 #endif
 
 #ifndef CLIENT_IDENTIFIER
@@ -280,6 +301,22 @@ extern const char root_cert_auth_end[]   asm("_binary_root_cert_auth_crt_end");
  */
 #define INCOMING_PUBLISH_RECORD_LEN    ( 10U )
 
+
+
+#define DEFAULT_UART_CHANNEL    (0)
+#define CONSOLE_UART_CHANNEL    (1 - DEFAULT_UART_CHANNEL)
+#define DEFAULT_UART_RX_PIN     (3)
+#define DEFAULT_UART_TX_PIN     (2)
+#define CONSOLE_UART_RX_PIN     (4)
+#define CONSOLE_UART_TX_PIN     (5)
+
+#define UARTS_BAUD_RATE         (115200)
+#define TASK_STACK_SIZE         (2048)
+#define READ_BUF_SIZE           (2048)
+
+
+
+
 /*-----------------------------------------------------------*/
 
 /**
@@ -368,6 +405,16 @@ static MQTTPubAckInfo_t pIncomingPublishRecords[ INCOMING_PUBLISH_RECORD_LEN ];
  * @brief Static buffer for TLS Context Semaphore.
  */
 static StaticSemaphore_t xTlsContextSemaphoreBuffer;
+
+/* Message printed by the "consoletest" command.
+ * It will also be used by the default UART to check the reply of the second
+ * UART. As end of line characters are not standard here (\n, \r\n, \r...),
+ * let's not include it in this string. */
+const char test_message[] = "This is an example string, if you can read this, the example is a success!";
+
+
+static const TickType_t delay = 3000 / portTICK_PERIOD_MS;  // 3sec.
+static const TickType_t delay2 = 5000 / portTICK_PERIOD_MS;  // 5sec.
 
 /*-----------------------------------------------------------*/
 
@@ -602,6 +649,308 @@ static uint32_t generateRandomNumber()
 {
     return( rand() );
 }
+
+
+/**
+ * @brief This function connects default UART TX to console UART RX and default
+ * UART RX to console UART TX. The purpose is to send commands to the console
+ * and get the reply directly by reading RX FIFO.
+ */
+static void connect_uarts(void)
+{
+    esp_rom_gpio_connect_out_signal(DEFAULT_UART_RX_PIN, UART_PERIPH_SIGNAL(1, SOC_UART_TX_PIN_IDX), false, false);
+    esp_rom_gpio_connect_in_signal(DEFAULT_UART_RX_PIN, UART_PERIPH_SIGNAL(0, SOC_UART_RX_PIN_IDX), false);
+
+    esp_rom_gpio_connect_out_signal(DEFAULT_UART_TX_PIN, UART_PERIPH_SIGNAL(0, SOC_UART_TX_PIN_IDX), false, false);
+    esp_rom_gpio_connect_in_signal(DEFAULT_UART_TX_PIN, UART_PERIPH_SIGNAL(1, SOC_UART_RX_PIN_IDX), false);
+}
+
+/**
+ * @brief Disconnect default UART from the console UART, this is used once
+ * testing is finished, it will let us print messages on the UART without
+ * sending them back to the console UART. Else, we would get an infinite
+ * loop.
+ */
+static void disconnect_uarts(void)
+{
+    esp_rom_gpio_connect_out_signal(CONSOLE_UART_TX_PIN, UART_PERIPH_SIGNAL(1, SOC_UART_TX_PIN_IDX), false, false);
+    esp_rom_gpio_connect_in_signal(CONSOLE_UART_RX_PIN, UART_PERIPH_SIGNAL(1, SOC_UART_RX_PIN_IDX), false);
+}
+
+/**
+ * @brief Configure and install the default UART, then, connect it to the
+ * console UART.
+ */
+static void configure_uarts(void)
+{
+    /* Configure parameters of an UART driver,
+     * communication pins and install the driver */
+    uart_config_t uart_config = {
+        .baud_rate = UARTS_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(DEFAULT_UART_CHANNEL, READ_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(DEFAULT_UART_CHANNEL, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(DEFAULT_UART_CHANNEL, DEFAULT_UART_TX_PIN, DEFAULT_UART_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+
+    connect_uarts();
+}
+
+/**
+ * @brief Function called when command `consoletest` will be invoked.
+ * It will simply print `test_message` defined above.
+ */
+static int console_test(int argc, char **argv) {
+    printf("%s\n", test_message);
+    return 0;
+}
+
+
+/**
+ * @brief Function executed in another task then main one (as the one main
+ * executes REPL console).
+ * It will send "consoletest" command to the console UART and then read back
+ * the response on RX.
+ * The response shall contain the test_message string.
+ */
+static void send_commands() {
+    static char data[READ_BUF_SIZE];
+    char command0[] = "config\r\n";
+    char command[]  = "processor\r\n";
+    char command2[] = "bw 4\r\n";
+    char command3[] = "sf 7\r\n";
+    char command4[] = "channel 1\r\n";
+    char command5[] = "panid 0001\r\n";
+    char command6[] = "ownid 0000\r\n";
+    char command7[] = "dstid 0001\r\n";
+    char command9[] = "power -4\r\n";
+    char command10[] = "start\r\n";
+
+    int len = 0;
+    void* substring = NULL;
+
+    printf("%s\n","test1\n");
+    vTaskDelay(delay);
+
+    /* Send the command `consoletest` to the console UART. */
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command0, sizeof(command0));
+    if ( len == -1 ) {
+       goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+       len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    printf("%s\n",data);
+
+
+
+    /* Send the command `consoletest` to the console UART. */
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command, sizeof(command));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command2, sizeof(command2));
+    if ( len == -1 ) {
+       goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+       len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command3, sizeof(command3));
+    if ( len == -1 ) {
+       goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+       len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command4, sizeof(command4));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+
+    printf("%s",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command5, sizeof(command5));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command6, sizeof(command6));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command7, sizeof(command7));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command9, sizeof(command9));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+
+    printf("%s\n",data);
+
+    len = uart_write_bytes(DEFAULT_UART_CHANNEL, command10, sizeof(command10));
+    if ( len == -1 ) {
+        goto end;
+    }
+    vTaskDelay(delay);
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    vTaskDelay(delay2);
+
+    /**
+     * Check whether we can find test_message in the received message. Before
+     * that, we need to add a NULL character to terminate the string.
+     */
+    data[len] = 0;
+    //substring = strcasestr(data, test_message);
+
+end:
+    /* This is a must to not send anything to the console anymore! */
+    //disconnect_uarts();
+    //printf("Result: %s\n", substring == NULL ? "Failure" : "Success");
+    printf("Response: %s\n", data);
+    //vTaskDelete(NULL);
+}
+
+static void uart_initialize(void)
+{
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.prompt = "repl >";
+    const esp_console_cmd_t cmd = {
+        .command = "consoletest",
+        .help = "Test console by sending a message",
+        .func = &console_test,
+    };
+    esp_console_dev_uart_config_t uart_config = {
+                                                    .channel = CONSOLE_UART_CHANNEL,
+                                                    .baud_rate = UARTS_BAUD_RATE,
+                                                    .tx_gpio_num = CONSOLE_UART_TX_PIN,
+                                                    .rx_gpio_num = CONSOLE_UART_RX_PIN,
+                                                };
+    /**
+     * As we don't have a real serial terminal, (we just use default UART to
+     * send and receive commands, ) we won't handle any escape sequence, so the
+     * easiest thing to do is set the console to "dumb" mode. */
+   linenoiseSetDumbMode(1);
+
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
+    configure_uarts();
+    send_commands();
+
+   ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+
+    /* Create a task for sending and receiving commands to and from the second UART. */
+//   xTaskCreate(send_commands, "send_commands_task", TASK_STACK_SIZE, NULL, 10, NULL);
+
+   ESP_ERROR_CHECK(esp_console_start_repl(repl));
+}
+
+
+static char* send_commands_read() {
+    static char data[READ_BUF_SIZE];
+    static char dataBuff[50] = {}; /*max 50bytes*/
+    int len = 0;
+
+    int counter = 0;
+    len = 0;
+
+    do {
+        len = uart_read_bytes(DEFAULT_UART_CHANNEL, data, READ_BUF_SIZE - 1, 250 / portTICK_RATE_MS);
+    } while (len == 0);
+
+    /*ascii mode only*/
+    for(int i = 0; i < 50; i++)
+    {
+      counter++;
+      dataBuff[i] = data[i];
+      if(data[i] == '\n')
+      {
+        break;
+      }
+    }
+    //printf("%s\n",dataBuff);
+
+    /**
+     * Check whether we can find test_message in the received message. Before
+     * that, we need to add a NULL character to terminate the string.
+     */
+    data[len] = 0;
+
+    return dataBuff;
+}
+
 
 /*-----------------------------------------------------------*/
 
@@ -1339,6 +1688,8 @@ static int publishToTopic( MQTTContext_t * pMqttContext )
     int returnStatus = EXIT_SUCCESS;
     MQTTStatus_t mqttStatus = MQTTSuccess;
     uint8_t publishIndex = MAX_OUTGOING_PUBLISHES;
+    char* dataMessage;
+
 
     assert( pMqttContext != NULL );
 
@@ -1347,6 +1698,10 @@ static int publishToTopic( MQTTContext_t * pMqttContext )
      * stored for supporting a resend if a network connection is broken before
      * receiving a PUBACK. */
     returnStatus = getNextFreeIndexForOutgoingPublishes( &publishIndex );
+
+    dataMessage = send_commands_read();
+
+    printf("%s\n", dataMessage);
 
     if( returnStatus == EXIT_FAILURE )
     {
@@ -1358,7 +1713,7 @@ static int publishToTopic( MQTTContext_t * pMqttContext )
         outgoingPublishPackets[ publishIndex ].pubInfo.qos = MQTTQoS1;
         outgoingPublishPackets[ publishIndex ].pubInfo.pTopicName = MQTT_EXAMPLE_TOPIC;
         outgoingPublishPackets[ publishIndex ].pubInfo.topicNameLength = MQTT_EXAMPLE_TOPIC_LENGTH;
-        outgoingPublishPackets[ publishIndex ].pubInfo.pPayload = MQTT_EXAMPLE_MESSAGE;
+        outgoingPublishPackets[ publishIndex ].pubInfo.pPayload = dataMessage;
         outgoingPublishPackets[ publishIndex ].pubInfo.payloadLength = MQTT_EXAMPLE_MESSAGE_LENGTH;
 
         /* Get a new packet id. */
@@ -1684,6 +2039,7 @@ int aws_iot_demo_main( int argc,
     /* Initialize MQTT library. Initialization of the MQTT library needs to be
      * done only once in this demo. */
     returnStatus = initializeMqtt( &mqttContext, &xNetworkContext );
+    uart_initialize();
 
     if( returnStatus == EXIT_SUCCESS )
     {
